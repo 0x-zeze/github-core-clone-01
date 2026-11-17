@@ -8,6 +8,11 @@ import { createHash } from 'node:crypto';
 export const ZERO_OID = '0'.repeat(40);
 const HEX40 = /^[0-9a-f]{40}$/;
 
+// packCache bounds (audit #6): at most 64 cached fetch packs / 64 MiB total.
+// Without them, distinct fetches grow the cache without limit.
+const MAX_PACK_CACHE_ENTRIES = 64;
+const MAX_PACK_CACHE_BYTES = 64 * 1024 * 1024;
+
 export function isOid(value) {
   return typeof value === 'string' && HEX40.test(value);
 }
@@ -211,6 +216,7 @@ export class Store {
     this.commitSeq = 0;
     this.treeFlatCache = new Map();
     this.packCache = new Map();
+    this.packCacheBytes = 0;
   }
 
   /** A deterministic ISO timestamp: the logical clock, never the wall clock. */
@@ -232,6 +238,33 @@ export class Store {
 
   invalidatePackCache() {
     this.packCache.clear();
+    this.packCacheBytes = 0;
+  }
+
+  /** Bounded LRU lookup for a cached fetch pack (refreshes recency on hit). */
+  packCacheGet(key) {
+    const hit = this.packCache.get(key);
+    if (!hit) return undefined;
+    this.packCache.delete(key);
+    this.packCache.set(key, hit);
+    return hit;
+  }
+
+  /** Bounded LRU insert for a cached fetch pack (evicts oldest first). */
+  packCacheSet(key, result) {
+    const bytes = result.pack?.length ?? 0;
+    const old = this.packCache.get(key);
+    if (old) {
+      this.packCacheBytes -= old.pack?.length ?? 0;
+      this.packCache.delete(key);
+    }
+    this.packCache.set(key, result);
+    this.packCacheBytes += bytes;
+    while ((this.packCache.size > MAX_PACK_CACHE_ENTRIES || this.packCacheBytes > MAX_PACK_CACHE_BYTES) && this.packCache.size > 1) {
+      const [oldestKey, oldest] = this.packCache.entries().next().value;
+      this.packCacheBytes -= oldest.pack?.length ?? 0;
+      this.packCache.delete(oldestKey);
+    }
   }
 
   repoKey(owner, name) {
@@ -769,7 +802,11 @@ Store.prototype.mergePull = function mergePull(repo, number) {
   if (this.pullConflicts(repo, pr)) return { error: 'Merge conflict', status: 405 };
   const headTip = repo.refs.get(`refs/heads/${pr.head.ref}`);
   const baseTip = repo.refs.get(`refs/heads/${pr.base.ref}`);
+  if (!headTip || !baseTip) return { error: 'Head or base branch is missing', status: 422 };
   const headCommit = this.commitOf(peelToCommit(this, headTip));
+  if (!headCommit) return { error: 'Head does not point at a commit', status: 422 };
+  const baseCommit = this.commitOf(peelToCommit(this, baseTip));
+  if (!baseCommit) return { error: 'Base does not point at a commit', status: 422 };
   const mergeSha = this.makeCommit(headCommit.tree, [peelToCommit(this, baseTip)], `Merge pull request #${pr.number} from ${repo.owner}/${pr.head.ref}`);
   repo.refs.set(`refs/heads/${pr.base.ref}`, mergeSha);
   pr.state = 'closed';

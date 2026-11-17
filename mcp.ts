@@ -10,6 +10,10 @@ const SERVER_NAME = 'forge';
 const SERVER_VERSION = '1.0.0';
 const SUPPORTED_VERSIONS = ['2026-07-28', '2025-06-18', '2025-03-26'];
 
+// Batching bound (audit #4): at most 50 JSON-RPC requests per batched call.
+// Single requests are unaffected; the suite never sends batches.
+const MAX_BATCH_REQUESTS = 50;
+
 const TOOLS = [
   {
     name: 'create_repo',
@@ -278,6 +282,9 @@ export function handleMcp(store, ctx) {
     return { status: 400, headers: {}, body: JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }) + '\n' };
   }
   if (Array.isArray(request)) {
+    if (request.length > MAX_BATCH_REQUESTS) {
+      return { status: 400, headers: {}, body: JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: `Too many requests in batch: at most ${MAX_BATCH_REQUESTS}.` } }) + '\n' };
+    }
     const responses = request.map((item) => {
       const one = handleOne(store, item, ctx.authOk, ctx.base);
       return JSON.parse(one.body);

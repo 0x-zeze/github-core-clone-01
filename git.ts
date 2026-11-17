@@ -12,6 +12,15 @@ import {
 
 const PKT_MAX = 65520;
 
+// Bounds that keep a crafted pack from exhausting process memory (audit #2):
+// one object may inflate to at most 16 MiB, one pack to 64 MiB inflated in
+// total, and a delta may not declare a target larger than 16 MiB or more than
+// 1024x its own encoded length. The suite's packs are kilobytes, so these
+// limits are far above anything legitimate.
+const MAX_INFLATED_OBJECT_BYTES = 16 * 1024 * 1024;
+const MAX_PACK_INFLATED_BYTES = 64 * 1024 * 1024;
+const MAX_DELTA_EXPANSION = 1024;
+
 export function pktLine(payload) {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   if (data.length + 4 > PKT_MAX) throw new Error('pkt-line too long');
@@ -139,6 +148,7 @@ function applyDelta(base, delta) {
     let value = 0;
     let shift = 0;
     for (;;) {
+      if (offset >= deltaBuffer.length) throw new Error('delta header truncated');
       const byte = deltaBuffer[offset++];
       value += (byte & 0x7f) * 2 ** shift;
       shift += 7;
@@ -149,8 +159,16 @@ function applyDelta(base, delta) {
   const sourceSize = readSize();
   const targetSize = readSize();
   if (sourceSize !== baseBuffer.length) throw new Error('delta base size mismatch');
+  // A few delta bytes must not be able to declare a gigabyte-sized target:
+  // cap the target absolutely, and relative to the encoding that claims it.
+  if (targetSize > MAX_INFLATED_OBJECT_BYTES) throw new Error('delta target too large');
+  if (targetSize > baseBuffer.length + MAX_DELTA_EXPANSION * deltaBuffer.length) throw new Error('delta target too large for its encoding');
   const out = Buffer.alloc(targetSize);
   let written = 0;
+  const readByte = () => {
+    if (offset >= deltaBuffer.length) throw new Error('delta truncated');
+    return deltaBuffer[offset++];
+  };
   while (offset < deltaBuffer.length) {
     const op = deltaBuffer[offset++];
     if (op & 0x80) {
@@ -158,19 +176,23 @@ function applyDelta(base, delta) {
       let copySize = 0;
       let shift = 0;
       for (let bit = 0; bit < 4; bit += 1) {
-        if (op & (1 << bit)) copyOffset += deltaBuffer[offset++] * 2 ** shift;
+        if (op & (1 << bit)) copyOffset += readByte() * 2 ** shift;
         shift += 8;
       }
       shift = 0;
       for (let bit = 4; bit < 7; bit += 1) {
-        if (op & (1 << bit)) copySize += deltaBuffer[offset++] * 2 ** shift;
+        if (op & (1 << bit)) copySize += readByte() * 2 ** shift;
         shift += 8;
       }
       if (copySize === 0) copySize = 0x10000;
+      if (copyOffset + copySize > baseBuffer.length) throw new Error('delta copy past end of base');
+      if (written + copySize > targetSize) throw new Error('delta writes past target');
       baseBuffer.copy(out, written, copyOffset, copyOffset + copySize);
       written += copySize;
     } else if (op !== 0) {
       const literal = op & 0x7f;
+      if (offset + literal > deltaBuffer.length) throw new Error('delta literal past end of delta');
+      if (written + literal > targetSize) throw new Error('delta writes past target');
       deltaBuffer.copy(out, written, offset, offset + literal);
       offset += literal;
       written += literal;
@@ -194,6 +216,7 @@ export function readPack(pack, resolveBase) {
   const version = buffer.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const declaredCount = buffer.readUInt32BE(8);
+  if (declaredCount > buffer.length) throw new Error('pack declares more objects than its bytes allow');
   const trailerStart = buffer.length - 20;
   const trailer = buffer.subarray(trailerStart).toString('hex');
   const computed = createHash('sha1').update(buffer.subarray(0, trailerStart)).digest('hex');
@@ -201,6 +224,7 @@ export function readPack(pack, resolveBase) {
   const raw = [];
   const byOffset = new Map();
   let offset = 12;
+  let inflatedTotal = 0;
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
     const header = readVarintSize(buffer, offset);
@@ -220,10 +244,13 @@ export function readPack(pack, resolveBase) {
     // One info:true call both inflates the stream and reports how many input bytes
     // the zlib stream consumed (engine.bytesWritten), so the next entry starts at
     // the right offset. inflateSync tolerates the trailing bytes of later entries.
-    const inflated = inflateSync(buffer.subarray(offset, trailerStart), { info: true });
+    // maxOutputLength caps a zlib bomb: a tiny stream must not inflate past 16 MiB.
+    const inflated = inflateSync(buffer.subarray(offset, trailerStart), { info: true, maxOutputLength: MAX_INFLATED_OBJECT_BYTES });
     const consumed = inflated.engine?.bytesWritten;
     if (!consumed || consumed <= 0) throw new Error('zlib stream consumed no bytes');
     entry.data = inflated.buffer;
+    inflatedTotal += entry.data.length;
+    if (inflatedTotal > MAX_PACK_INFLATED_BYTES) throw new Error('pack inflates past the size limit');
     offset = offset + consumed;
     raw.push(entry);
     byOffset.set(entryOffset, entry);
@@ -448,10 +475,10 @@ export function cachedFetch(store, repo, request) {
     [...new Set(request.shallow ?? [])].sort().join(','),
     request.depth ?? '',
   ].join('|');
-  const cached = store.packCache.get(key);
+  const cached = store.packCacheGet(key);
   if (cached) return cached;
   const result = computeFetch(store, repo, request);
-  store.packCache.set(key, result);
+  store.packCacheSet(key, result);
   return result;
 }
 
@@ -658,6 +685,13 @@ export function handleUploadPack(store, owner, repoName, body, gitProtocol) {
 export function handleReceivePack(store, owner, repoName, body) {
   const repo = store.getRepo(owner, repoName);
   if (!repo) return { status: 404, contentType: 'application/json; charset=utf-8', body: Buffer.from(JSON.stringify({ message: 'Not Found' }) + '\n') };
+  // A ref may only point at a commit, or at a tag (which peels to a commit).
+  // A branch pointing at a blob or tree breaks merge (headCommit is null) and
+  // leaves a pull request permanently unmergeable.
+  const isRefTarget = (oid) => {
+    const object = store.getObject(oid);
+    return !!object && (object.type === 'commit' || object.type === 'tag');
+  };
   const { packets, rest } = decodePktLines(body);
   const commands = [];
   for (const packet of packets) {
@@ -710,7 +744,7 @@ export function handleReceivePack(store, owner, repoName, body) {
       } else if (command.oldOid === ZERO_OID) {
         // create
         if (current !== undefined) reason = 'already exists';
-        else if (!store.getObject(command.newOid)) reason = 'missing object';
+        else if (!isRefTarget(command.newOid)) reason = 'invalid object type';
         else {
           repo.refs.set(command.ref, command.newOid);
           ok = true;
@@ -719,7 +753,7 @@ export function handleReceivePack(store, owner, repoName, body) {
         // update
         if (current === undefined) reason = 'non-fast-forward';
         else if (command.oldOid !== current) reason = 'non-fast-forward';
-        else if (!store.getObject(command.newOid)) reason = 'missing object';
+        else if (!isRefTarget(command.newOid)) reason = 'invalid object type';
         else if (!store.isAncestor(command.oldOid, command.newOid)) reason = 'non-fast-forward';
         else {
           repo.refs.set(command.ref, command.newOid);

@@ -352,7 +352,11 @@ function valueFromAst(node, variables) {
 
 // ---------------------------------------------------------- validation
 
-function validateSelection(typeName, selectionSet, fragments, errors, seenFragments = new Set()) {
+function validateSelection(typeName, selectionSet, fragments, errors, seenFragments = new Set(), depth = 0) {
+  if (depth > MAX_SELECTION_DEPTH) {
+    errors.push({ message: 'Query selection is too deep.' });
+    return;
+  }
   for (const selection of selectionSet) {
     if (selection.kind === 'fragmentSpread') {
       if (seenFragments.has(selection.name)) continue;
@@ -362,11 +366,11 @@ function validateSelection(typeName, selectionSet, fragments, errors, seenFragme
         errors.push({ message: `Unknown fragment "${selection.name}".` });
         continue;
       }
-      validateSelection(fragment.typeCondition, fragment.selectionSet, fragments, errors, seenFragments);
+      validateSelection(fragment.typeCondition, fragment.selectionSet, fragments, errors, seenFragments, depth + 1);
       continue;
     }
     if (selection.kind === 'inlineFragment') {
-      validateSelection(selection.typeCondition ?? typeName, selection.selectionSet, fragments, errors, seenFragments);
+      validateSelection(selection.typeCondition ?? typeName, selection.selectionSet, fragments, errors, seenFragments, depth + 1);
       continue;
     }
     if (selection.name === '__typename') continue;
@@ -377,7 +381,7 @@ function validateSelection(typeName, selectionSet, fragments, errors, seenFragme
     }
     if (selection.selectionSet) {
       const childType = CHILD_TYPE[`${typeName}.${selection.name}`];
-      if (childType && childType !== 'Node') validateSelection(childType, selection.selectionSet, fragments, errors, seenFragments);
+      if (childType && childType !== 'Node') validateSelection(childType, selection.selectionSet, fragments, errors, seenFragments, depth + 1);
     }
   }
 }
@@ -663,7 +667,14 @@ const RESOLVERS = {
 
 // ---------------------------------------------------------- execution
 
-function resolveField(store, obj, typeName, field, variables, errors, fragments) {
+// Batching / complexity bounds (audit #4): at most 50 operations per batched
+// request, selection nesting at most 25 deep, and a fragment may not spread
+// itself (directly or through another fragment). The suite's queries are a
+// few operations deep at most, so these limits are far above legitimate use.
+const MAX_BATCH_OPERATIONS = 50;
+const MAX_SELECTION_DEPTH = 25;
+
+function resolveField(store, obj, typeName, field, variables, errors, fragments, depth = 0, activeFragments = new Set()) {
   if (field.name === '__typename') return obj?.__typename ?? typeName;
   const args = {};
   for (const [key, value] of Object.entries(field.arguments ?? {})) args[key] = valueFromAst(value, variables);
@@ -681,32 +692,42 @@ function resolveField(store, obj, typeName, field, variables, errors, fragments)
   if (field.selectionSet) {
     if (value === null) return null;
     const childType = CHILD_TYPE[`${typeName}.${field.name}`] ?? value.__typename ?? typeName;
-    if (Array.isArray(value)) return value.map((item) => resolveSelection(store, item, childType, field.selectionSet, variables, errors, fragments));
-    return resolveSelection(store, value, childType, field.selectionSet, variables, errors, fragments);
+    if (Array.isArray(value)) return value.map((item) => resolveSelection(store, item, childType, field.selectionSet, variables, errors, fragments, depth + 1, activeFragments));
+    return resolveSelection(store, value, childType, field.selectionSet, variables, errors, fragments, depth + 1, activeFragments);
   }
   return value;
 }
 
-function resolveSelection(store, obj, typeName, selectionSet, variables, errors, fragments) {
+function resolveSelection(store, obj, typeName, selectionSet, variables, errors, fragments, depth = 0, activeFragments = new Set()) {
+  if (depth > MAX_SELECTION_DEPTH) {
+    errors.push({ message: 'Query selection is too deep.' });
+    return {};
+  }
   const out = {};
   for (const selection of selectionSet) {
     if (selection.kind === 'fragmentSpread') {
+      if (activeFragments.has(selection.name)) {
+        errors.push({ message: `Fragment "${selection.name}" spreads itself.` });
+        continue;
+      }
       const fragment = fragments[selection.name];
       if (!fragment) {
         errors.push({ message: `Unknown fragment "${selection.name}".` });
         continue;
       }
       if (fragment.typeCondition && obj?.__typename && obj.__typename !== fragment.typeCondition) continue;
-      Object.assign(out, resolveSelection(store, obj, fragment.typeCondition ?? typeName, fragment.selectionSet, variables, errors, fragments));
+      activeFragments.add(selection.name);
+      Object.assign(out, resolveSelection(store, obj, fragment.typeCondition ?? typeName, fragment.selectionSet, variables, errors, fragments, depth + 1, activeFragments));
+      activeFragments.delete(selection.name);
       continue;
     }
     if (selection.kind === 'inlineFragment') {
       if (selection.typeCondition && obj?.__typename && obj.__typename !== selection.typeCondition) continue;
-      Object.assign(out, resolveSelection(store, obj, selection.typeCondition ?? typeName, selection.selectionSet, variables, errors, fragments));
+      Object.assign(out, resolveSelection(store, obj, selection.typeCondition ?? typeName, selection.selectionSet, variables, errors, fragments, depth + 1, activeFragments));
       continue;
     }
     const responseKey = selection.alias ?? selection.name;
-    out[responseKey] = resolveField(store, obj, typeName, selection, variables, errors, fragments);
+    out[responseKey] = resolveField(store, obj, typeName, selection, variables, errors, fragments, depth, activeFragments);
   }
   return out;
 }
@@ -749,7 +770,11 @@ function executeOne(store, operation) {
 /** Execute one GraphQL request body (a single operation document, or an array for batching). */
 export function handleGraphQL(store, body) {
   let result;
-  if (Array.isArray(body)) result = body.map((operation) => executeOne(store, operation));
-  else result = executeOne(store, body ?? {});
+  if (Array.isArray(body)) {
+    if (body.length > MAX_BATCH_OPERATIONS) {
+      return { status: 400, headers: {}, body: JSON.stringify({ errors: [{ message: `Too many operations in batch: at most ${MAX_BATCH_OPERATIONS}.` }] }) + '\n' };
+    }
+    result = body.map((operation) => executeOne(store, operation));
+  } else result = executeOne(store, body ?? {});
   return { status: 200, headers: {}, body: JSON.stringify(result) + '\n' };
 }

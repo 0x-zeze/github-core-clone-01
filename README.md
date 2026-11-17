@@ -28,8 +28,9 @@ MAKEFUN_ENV_URL=http://127.0.0.1:8080 MAKEFUN_SHOP_TOKEN=<token> node main.ts
 `main.ts` (the kit starter, kept as-is) binds an ephemeral port, registers it
 with the env, then polls `/done` until the trial ends. Without
 `MAKEFUN_ENV_URL` it exits at once. When `MAKEFUN_SHOP_TOKEN` is set, the
-API surfaces require `Authorization: Bearer <token>`; git and `/healthz`
-never do. The store is deterministic: timestamps come from a logical
+API surfaces require `Authorization: Bearer <token>`; git receive-pack does
+too, and private repos are unreadable over git without the token. Public
+repos stay openly cloneable and `/healthz` never requires auth. The store is deterministic: timestamps come from a logical
 counter clock, never the wall clock, so two runs export identical state.
 
 ## Files

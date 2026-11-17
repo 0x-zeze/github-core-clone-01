@@ -241,7 +241,10 @@ export function handleRest(store, ctx) {
     if (rest.length === 2 && rest[0] === 'git' && rest[1] === 'refs' && method === 'POST') {
       const ref = body?.ref;
       const sha = body?.sha;
-      if (!ref || !sha || !isOid(sha) || !store.getObject(sha)) return err(422, 'Invalid ref or sha');
+      // A ref may only point at a commit or a tag (which peels to a commit);
+      // a blob/tree target breaks merge and strands the pull request.
+      const target = isOid(sha) ? store.getObject(sha) : null;
+      if (!ref || !sha || !target || (target.type !== 'commit' && target.type !== 'tag')) return err(422, 'Invalid ref or sha');
       if (repo.refs.has(ref)) return err(422, 'Reference already exists');
       repo.refs.set(ref, sha);
       repo.updatedAt = store.nowIso();
@@ -271,7 +274,8 @@ export function handleRest(store, ctx) {
       if (!oid) return notFound();
       return ok(200, { name: branch, commit: { sha: oid, url: '' }, protected: false });
     }
-    // GET /repos/{o}/{r}/commits
+    // GET /repos/{o}/{r}/commits (paginated like every other list endpoint:
+    // per_page defaults to 30 and caps at 100, with Link headers)
     if (rest.length === 1 && rest[0] === 'commits' && method === 'GET') {
       const ref = query.get('sha') ?? repo.defaultBranch;
       let tip = repo.refs.get(`refs/heads/${ref}`);
@@ -291,7 +295,8 @@ export function handleRest(store, ctx) {
         const commit = store.commitOf(peeled);
         for (const parent of commit.parents) queue.push(parent);
       }
-      return ok(200, out);
+      const page = paginate(out, query, base, pathname);
+      return ok(200, page.items, { Link: page.link });
     }
     // /repos/{o}/{r}/contents/{path...}
     if (rest[0] === 'contents') {

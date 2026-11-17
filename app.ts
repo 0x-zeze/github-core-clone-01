@@ -6,9 +6,11 @@
 //   MCP             /mcp
 //
 // Auth: when MAKEFUN_SHOP_TOKEN is set, the API surfaces require the exact
-// Bearer token; git and /healthz never do. Every reply carries a non-empty
-// X-GitHub-Request-Id and a JSON content type (git replies carry their own
-// x-git-* types instead).
+// Bearer token. Git write access (receive-pack) always does too, and private
+// repos are unreadable over git without it; public repos stay openly
+// cloneable and /healthz never requires auth. Every reply carries a
+// non-empty X-GitHub-Request-Id and a JSON content type (git replies carry
+// their own x-git-* types instead).
 
 import { createServer } from 'node:http';
 import { Store } from './store.ts';
@@ -95,10 +97,25 @@ export function createApp() {
         return;
       }
 
-      // --- git smart HTTP (no Bearer auth: the protocol carries none) ---
+      // --- git smart HTTP ---
+      // receive-pack mutates refs, so it always needs the Bearer token when
+      // one is configured; private repos are not readable over git without
+      // it either (info/refs advertises refs, upload-pack serves objects).
+      // Public repos stay openly cloneable, as the git protocol expects.
       const gitMatch = GIT_PATH.exec(path);
       if (gitMatch) {
         const [, owner, repoName, service] = gitMatch;
+        if (service === 'git-receive-pack' && method === 'POST' && !authOk(req)) {
+          sendJson(res, 401, { message: 'Bad credentials' });
+          return;
+        }
+        if ((service === 'info/refs' || service === 'git-upload-pack') && !authOk(req)) {
+          const repo = store.getRepo(owner, repoName);
+          if (repo && repo.private) {
+            sendJson(res, 401, { message: 'Bad credentials' });
+            return;
+          }
+        }
         if (service === 'info/refs' && method === 'GET') {
           const gitService = url.searchParams.get('service');
           if (gitService !== 'git-upload-pack' && gitService !== 'git-receive-pack') {
