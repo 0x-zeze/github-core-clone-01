@@ -1,5 +1,9 @@
 # github-core-clone-01 — a GitHub-compatible git forge
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/0x-zeze/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/0x-zeze/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 One Node process, no dependencies, no outside service. It serves all four
 surfaces from a single in-memory store with its own git object store:
 
@@ -38,3 +42,5 @@ counter clock, never the wall clock, so two runs export identical state.
 - `graphql.ts` — GraphQL parser, validator and executor
 - `mcp.ts` — MCP JSON-RPC dispatch and tools
 - `scenario.ts` — the scenario PRNG (study aid; not imported by the server)
+
+<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
